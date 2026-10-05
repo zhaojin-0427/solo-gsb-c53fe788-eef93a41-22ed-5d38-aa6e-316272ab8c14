@@ -2,6 +2,9 @@
 
 给定一个历元时刻的卫星 ECI 状态与地面观测站坐标，预测指定 UTC 时间区间内
 卫星相对观测站的可见窗口（升/落时刻、峰值仰角及其时刻、方位角等）。
+`POST /relay-plan` 进一步接收**多个**带唯一 ID 与各自最低仰角的测站，逐站
+复用同一套两体传播与可见性证明，求搜索区间内**最长的连续接力时段**：
+哪些测站各负责哪一段、在什么时刻切换。
 
 - **语言/框架**：Python 3.11+、FastAPI、NumPy、Pydantic v2
 - **动力学**：纯两体开普勒传播（WGS84 引力常数），牛顿迭代解开普勒方程
@@ -28,7 +31,8 @@ docker compose up --build
 | 用途 | 地址 |
 | --- | --- |
 | 健康检查 | `GET http://localhost:8000/health` |
-| 过境预测 | `POST http://localhost:8000/passes` |
+| 过境预测（单站） | `POST http://localhost:8000/passes` |
+| **多站接力计划** | **`POST http://localhost:8000/relay-plan`** |
 | 交互式文档（Swagger UI） | `http://localhost:8000/docs` |
 | OpenAPI 模式 | `http://localhost:8000/openapi.json` |
 
@@ -213,6 +217,212 @@ curl -X POST http://localhost:8000/passes \
 
 ---
 
+## 3bis. 多站接力计划（POST /relay-plan）
+
+在 `/passes` 的同一颗卫星、同一个历元与搜索区间上，给出一个**非空**测站
+列表（每站有唯一 `id`、经纬高与各自的 `min_elevation_deg`）。服务逐站复用
+现有的两体传播与 `find_passes`，只使用其**已证**结果：
+
+- 每个返回窗口都是**已证可见**的半开区间 `[start, end)`（`start_open` /
+  `end_open` 表示被搜索边界截断，`truncated` 表示被数值失败截断）；
+- `uncovered_intervals` 是该站既不能证明可见、也不能证明不可见的时段。
+
+随后在“已证可见”窗口构成的图上求搜索期内**最长的连续接力时段**：
+
+- 相邻两段由**不同**测站负责；只有当两站窗口有**严格正时长的重叠**时
+  才允许切换（仅端点相接不算重叠）。切换时刻取进入窗口的起点，保证
+  切换瞬间两站都在各自的已证可见区间内，覆盖无空洞。
+- 同一测站首尾相接的多个窗口无需切换，自动并为一段连续可见跨度。
+- 等长方案：先取**切换次数更少**者；再相同则按**开始时刻更早**、
+  最后按**站 ID 序列字典序**裁决，结果完全确定。
+- 某站在某时段未覆盖、但**别站可证可见**时，接力照常进行。
+- 只有当**没有任何站可证可见**、且至少有一站把该时段报为未覆盖时，
+  该时段才进入 `unknown_intervals`——此时**不会**报“确定不可见”，
+  也不会把它算作接力覆盖。
+
+### 请求格式
+
+Content-Type: `application/json`，所有时间为带时区 UTC。字段
+`epoch` / `start` / `end` / `satellite` 的含义与校验同 `/passes`；
+区别在于用 `stations` 数组替代单个 `station`，且最低仰角**逐站指定**。
+
+| 字段 | 类型 | 单位 / 范围 | 说明 |
+| --- | --- | --- | --- |
+| `stations` | array | 长度 ≥ 1 | 候选测站，`id` 必须唯一且非空白 |
+| `stations[].id` | string | 非空 | 测站唯一标识（计划/切换中引用） |
+| `stations[].latitude_deg` | number | 度，[-90, 90] | WGS84 大地纬度 |
+| `stations[].longitude_deg` | number | 度，[-180, 180] | WGS84 经度 |
+| `stations[].altitude_km` | number | km，[-12, 100000] | WGS84 椭球高 |
+| `stations[].min_elevation_deg` | number | 度，(-90, 90) | 该站最低仰角 |
+
+### 实际请求示例（5 站 4 次切换的接力链）
+
+类 ISS 轨道、25° 最低仰角、30 分钟搜索区间；5 个沿轨迹由西向东排布的
+测站（蒙古高原 ULN、北京 BJS、黄海 YEL、琉球 RYU、菲律宾以东 PHL），
+其已证可见窗口首尾正重叠，强制形成一条 5 站接力链。完整文件见
+[`examples/relay_request.json`](examples/relay_request.json)：
+
+```bash
+curl -X POST http://localhost:8000/relay-plan \
+  -H 'Content-Type: application/json' \
+  -d @examples/relay_request.json
+```
+
+请求体（节选）：
+
+```json
+{
+  "epoch": "2025-06-01T00:00:00Z",
+  "start": "2025-06-01T00:00:00Z",
+  "end": "2025-06-01T00:30:00Z",
+  "satellite": {
+    "position_km": [4270.307144917519, -1323.5276198332833, 5121.271150639637],
+    "velocity_km_s": [3.950957000514434, 6.347260232247907, -1.6540865405752112]
+  },
+  "stations": [
+    {"id": "ULN",  "latitude_deg": 45.0, "longitude_deg": 108.0, "altitude_km": 0.05, "min_elevation_deg": 25.0},
+    {"id": "BJS",  "latitude_deg": 39.9, "longitude_deg": 116.4, "altitude_km": 0.05, "min_elevation_deg": 25.0},
+    {"id": "YEL",  "latitude_deg": 35.0, "longitude_deg": 128.0, "altitude_km": 0.05, "min_elevation_deg": 25.0},
+    {"id": "RYU",  "latitude_deg": 30.0, "longitude_deg": 132.0, "altitude_km": 0.05, "min_elevation_deg": 25.0},
+    {"id": "PHL",  "latitude_deg": 20.0, "longitude_deg": 135.0, "altitude_km": 0.05, "min_elevation_deg": 25.0}
+  ]
+}
+```
+
+### 实际响应（HTTP 200）
+
+与 [`examples/relay_response.json`](examples/relay_response.json) 一致：
+
+```json
+{
+  "status": "complete",
+  "plan": {
+    "start": "2025-06-01T00:01:05.760119Z",
+    "end": "2025-06-01T00:13:36.099663Z",
+    "duration_s": 750.339544,
+    "switch_count": 4,
+    "segments": [
+      {"station_id": "ULN", "start": "2025-06-01T00:01:05.760119Z", "end": "2025-06-01T00:03:14.455707Z", "duration_s": 128.695588},
+      {"station_id": "BJS", "start": "2025-06-01T00:03:14.455707Z", "end": "2025-06-01T00:06:07.934530Z", "duration_s": 173.478823},
+      {"station_id": "YEL", "start": "2025-06-01T00:06:07.934530Z", "end": "2025-06-01T00:07:38.505114Z", "duration_s": 90.570584},
+      {"station_id": "RYU", "start": "2025-06-01T00:07:38.505114Z", "end": "2025-06-01T00:10:12.483339Z", "duration_s": 153.978225},
+      {"station_id": "PHL", "start": "2025-06-01T00:10:12.483339Z", "end": "2025-06-01T00:13:36.099663Z", "duration_s": 203.616324}
+    ],
+    "switches": [
+      {"time": "2025-06-01T00:03:14.455707Z", "from_station_id": "ULN", "to_station_id": "BJS"},
+      {"time": "2025-06-01T00:06:07.934530Z", "from_station_id": "BJS", "to_station_id": "YEL"},
+      {"time": "2025-06-01T00:07:38.505114Z", "from_station_id": "YEL", "to_station_id": "RYU"},
+      {"time": "2025-06-01T00:10:12.483339Z", "from_station_id": "RYU", "to_station_id": "PHL"}
+    ]
+  },
+  "stations": [
+    {"id": "ULN", "status": "complete", "min_elevation_deg": 25.0,
+     "proven_windows": [{"start": "2025-06-01T00:01:05.760119Z", "end": "2025-06-01T00:04:46.735022Z",
+                         "start_open": false, "end_open": false, "truncated": false}],
+     "uncovered_intervals": []}
+  ],
+  "unknown_intervals": [],
+  "search_start": "2025-06-01T00:00:00Z",
+  "search_end": "2025-06-01T00:30:00Z",
+  "diagnostics": {
+    "search_span_s": 1800.0,
+    "proven_visible_seconds": 750.339544,
+    "proven_visible_fraction": 0.41685530222222217,
+    "unknown_seconds": 0.0,
+    "relay_covered_seconds": 750.339544,
+    "relay_coverage_fraction": 0.4168553022222222,
+    "station_count": 5
+  }
+}
+```
+
+> 上例 `stations` 实际含 5 个元素，此处为节省篇幅只完整展示了 ULN 一项；
+> 其余 4 项结构相同。每个切换时刻都落在前后两站窗口的**正重叠内**：
+> 例如 `00:03:14.455707` 既是 BJS 窗口的起点，又严格位于 ULN 窗口
+> （止于 `00:04:46.735022`）之中，故切换瞬间两站都已证可见。
+
+如何读取接力结果：
+
+- **各站负责区间**：`plan.segments[]`，按时间排列、首尾相接，恰好铺满
+  `plan.start`～`plan.end`；`station_id` 即该段的负责站。
+- **切换时刻**：`plan.switches[]`，每个含 `time` 与 `from/to_station_id`；
+  切换时刻的个数就是 `plan.switch_count`，且 `segments` 的边界与
+  `switches[].time` 一一对应。
+- **最长连续接力**：`plan.start`/`end`/`duration_s` 给出搜索区间内最长的
+  一段无空洞接力（等长时按“切换更少 → 开始更早 → 站 ID 字典序”裁决）。
+- `stations[]`：逐站回传 `find_passes` 的 `status`、已证可见半开窗口
+  （含 `start_open`/`end_open`/`truncated`）与其 `uncovered_intervals`。
+- `unknown_intervals[]`：无人可证可见、但存在未覆盖的**未知时段**（含
+  原因）；它**不**计入接力，也**不**被宣称确定不可见。
+
+### status 语义与未知时段
+
+顶层 `status`：
+
+- `complete`：存在接力计划且没有未知时段；或**没有任何站能看见**且整个
+  搜索区间都被证明不可见（此时 `plan` 为 `null`）。
+- `partial`：存在接力计划，但搜索区间内另有 `unknown_intervals`。
+- `failed`：没有任何已证可见窗口，且至少有一段未知（无法判定）。
+
+**全部站都已证不可见**时返回**空计划**（不是错误）：`plan` 为 `null`、
+`unknown_intervals` 为空、`status` 为 `complete`。
+
+下例中 ULN（25°）已证可见到 `00:04:46`，而 GRAZE 站把最低仰角设在其峰值
+之上 1e-7°，峰值附近约 4 ms 的擦边区间无法在 1 µs 精度内判定；该时段
+ULN 已落、无人可证可见，故如实列为未知，`status=partial`
+（请求/响应见 [`examples/relay_unknown_request.json`](examples/relay_unknown_request.json)
+与 [`examples/relay_unknown_response.json`](examples/relay_unknown_response.json)）：
+
+```json
+{
+  "status": "partial",
+  "plan": {
+    "start": "2025-06-01T00:01:05.760119Z",
+    "end": "2025-06-01T00:04:46.735022Z",
+    "duration_s": 220.974903,
+    "switch_count": 0,
+    "segments": [{"station_id": "ULN", "start": "2025-06-01T00:01:05.760119Z",
+                  "end": "2025-06-01T00:04:46.735022Z", "duration_s": 220.974903}],
+    "switches": []
+  },
+  "unknown_intervals": [
+    {"start": "2025-06-01T00:05:05.709124Z", "end": "2025-06-01T00:05:05.713400Z",
+     "reason": "station 'GRAZE': possible short grazing pass: below-threshold interval not provably invisible and crossing not resolvable at 1 us reporting resolution"}
+  ]
+}
+```
+
+> 反过来，若某站在某时段“未覆盖”、但**另一站在同一时段可证可见**，该时段
+> 不进入 `unknown_intervals`，接力照常延续。
+
+### `/relay-plan` 的 422 校验规则
+
+沿用 `/passes` 的全部时间/坐标/轨道校验，此外：
+
+- `stations` 为空 → 422；
+- 任意两个 `stations[].id` 相同（或为纯空白）→ 422，例如：
+
+```json
+{
+  "detail": [
+    {
+      "type": "value_error",
+      "loc": ["body"],
+      "msg": "Value error, station ids must be unique; duplicate id(s): 'ULN'",
+      "input": { "epoch": "2025-06-01T00:00:00Z", "...": "..." },
+      "ctx": { "error": {} }
+    }
+  ]
+}
+```
+
+- 轨道退化/非束缚、近地点穿地（`orbit_degenerate_or_invalid` /
+  `orbit_impact_earth`）→ 422；
+- 搜索区间相对 `epoch` 超出 ±10 年、跨度超过 7 天、时间顺序非法或不带
+  时区 → 422；逐站经纬高/仰角越界、未知字段 → 422。
+
+---
+
 ## 4. 算法说明
 
 ### 4.1 两体传播
@@ -284,7 +494,41 @@ e < 1。任意时刻 t = t₀ + Δt 用开普勒方程 M = E − e·sin E
 典型开销（单机纯 Python）：7 天类 ISS 任务约 8300 次粗扫 + 6.7 万次
 细扫求值，耗时约 7 秒；6 小时任务约 0.1–0.5 秒。高轨（GEO、闪电轨道）
 更省或相当。病态擦边场景（峰值距阈值 <1e-6°）会触发递归细分，
-单次请求额外求值以 20 万次为上限。
+单次请求额外求值以 20 万次为上限。`/relay-plan` 对每站各跑一次
+`find_passes`，开销约为单站的站数倍（接力图本身仅在窗口数上做
+O(N²) 的小规模松弛，可忽略）。
+
+### 4.6 多站接力规划（relay.py）
+
+输入只有 `find_passes` 的**已证**产物：每站的已证可见半开窗口与其
+`uncovered_intervals`、站级 `status`。规划分三步：
+
+1. **并窗**：同一站首尾相接（共享端点）或重叠的窗口无需切换，先合并为
+   一段连续“已证可见跨度”；跨站仅端点相接**不**并（半开区间在该点只有
+   一侧可见，构不成正重叠）。
+2. **连通分量**：两段跨度当且仅当属于**不同站**且有**严格正时长重叠**时
+   相连（一段跨度可同时桥接多个已有分量，触发合并）。每个连通分量即一段
+   “存在某种无空洞接力”的时间范围。
+3. **最少切换链（分量内 DAG）**：边 u→v 存在当且仅当站不同、v 起点不早于
+   u、v 终点严格更晚、两窗正重叠。终点沿边严格增大，故按终点排序做一次
+   拓扑松弛即可求最少切换数；标号为 `(切换数, 站 ID 序列)`，后者作为
+   字典序裁决，保证同一切换数下结果确定。切换时刻取进入窗口的起点——
+   它位于两窗正重叠区间内，切换瞬间双方都已证可见。
+
+各分量取其最优链后，再在分量间按 **时长（1 µs 分辨率）→ 切换数更少 →
+开始时刻更早 → 站 ID 序列字典序**选出搜索期内最长的连续接力时段。
+`segments` 由相邻窗口起点切分，首尾恰好铺满该时段且互不重叠。
+
+**未知时段**：把各站 `uncovered_intervals` 合并后，扣除“至少有一站
+已证可见”的部分；剩下的才是“无人可证可见且有站未覆盖”的时段，进入
+`unknown_intervals` 并合并原因。它既不计入接力，也不会被报成确定不可见
+（确定不可见的时段什么都不报，正如 `/passes` 中已证无窗口即为
+`complete`）。
+
+**正确性边界**：接力的每一段都是某次 `find_passes` 的已证可见窗口，
+因此整条链上每个时刻都有至少一站可证可见；切换只发生在正重叠内，
+半开语义下覆盖连续无空洞。规划器不引入任何新的数值近似——所有可见性
+结论都继承自第 4.3 节带 Lipschitz 证明的扫描。
 
 ---
 
@@ -292,13 +536,14 @@ e < 1。任意时刻 t = t₀ + Δt 用开普勒方程 M = E − e·sin E
 
 ```
 app/
-  main.py        # FastAPI 路由、422 映射、响应组装
-  schemas.py     # Pydantic 请求/响应模型与范围校验
+  main.py        # FastAPI 路由、422 映射、/passes 与 /relay-plan 响应组装
+  schemas.py     # Pydantic 请求/响应模型与范围校验（含逐站列表/唯一 ID）
   mechanics.py   # WGS84 常数、两体开普勒传播
   geometry.py    # 大地坐标、GMST、ECI/ECEF、ENU、仰角/方位角
   passes.py      # 两级自适应扫描、二分穿越、黄金分割峰值
+  relay.py       # 多站接力：已证窗口连通分量、最少切换 DAG、未知时段
   time_utils.py  # UTC/儒略日/GMST
-examples/        # 真实请求、成功响应与 422 响应
-tests/           # pytest：24 项（含独立网格真值交叉验证、擦边过境回归、422 全分支）
+examples/        # /passes 与 /relay-plan 的真实请求、成功响应与 422 响应
+tests/           # pytest：/passes、relay 规划器单元测试、/relay-plan HTTP 测试
 Dockerfile, docker-compose.yml, requirements.txt
 ```
