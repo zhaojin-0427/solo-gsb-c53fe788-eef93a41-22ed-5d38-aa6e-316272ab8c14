@@ -28,7 +28,8 @@ docker compose up --build
 | 用途 | 地址 |
 | --- | --- |
 | 健康检查 | `GET http://localhost:8000/health` |
-| 过境预测 | `POST http://localhost:8000/passes` |
+| 过境预测（单站） | `POST http://localhost:8000/passes` |
+| 接力计划（多站） | `POST http://localhost:8000/relay-plan` |
 | 交互式文档（Swagger UI） | `http://localhost:8000/docs` |
 | OpenAPI 模式 | `http://localhost:8000/openapi.json` |
 
@@ -213,9 +214,191 @@ curl -X POST http://localhost:8000/passes \
 
 ---
 
-## 4. 算法说明
+## 4. 多站接力计划（POST /relay-plan）
 
-### 4.1 两体传播
+给定与 `/passes` 相同的历元、ECI 卫星状态与 UTC 搜索区间，以及一个
+**非空的测站列表**（每站带**唯一 ID**、坐标和本站的最低仰角），服务对每站
+**复用同一套两体传播与 `find_passes`** 求可见性，然后在所有站“已证可见”的
+窗口上规划搜索期内的**最长连续接力时段**：由哪些站各负责哪一段、在什么时刻
+交接。
+
+### 4.1 接力规则（只使用已证可见）
+
+- 每个站的可见性**逐站**调用现有的两体传播 + `find_passes` 得到。站级
+  `status`、**半开**窗口 `[start, end)`、`truncated` 截断标志与
+  `uncovered_intervals` 一律保留，窗口本身即“已证可见时段”。
+- **交接只能在两个站窗口有正时长重叠时发生**：
+  `max(start_A, start_B) < min(end_A, end_B)`。仅在某一瞬时相接的两个窗口
+  不能交接（半开区间下该点不属于前一站）。切换时刻取前一站窗口的 `end`，
+  该时刻严格落在后一站窗口内部，因此交接无缝、双方在切换前后均已证可见。
+- 目标是搜索期内的**最长连续接力时段**；等长时先选**切换次数少**的方案，
+  再按**开始时刻更早**、负责站 **ID 元组字典序最小**稳定裁决。
+- 某站自己无法覆盖、但**别的站在该时段已证可见**时，接力照常进行（该时段
+  不算未知）。
+- **无人可证可见、但至少有一站在该时段无法判定**（出现在其
+  `uncovered_intervals` 中）时，该段列入 `unknown_intervals`（附各站原因），
+  `status` 如实降级——**既不报“确定不可见”，也不报“完整覆盖”**。所有站都
+  已用变化率界证明低于门限的时段才是确定不可见，不列入未知区间。
+- 没有任何可见窗口时返回**空计划**（`plan: null`）：同时存在未判定时段则
+  `status` 为 `failed`，全部确定不可见则 `status` 为 `complete`。
+
+### 4.2 请求格式
+
+Content-Type: `application/json`，所有时间为带时区 UTC。
+
+| 字段 | 类型 | 单位 / 范围 | 说明 |
+| --- | --- | --- | --- |
+| `epoch` | string | UTC 时间 | 卫星状态向量的历元（同 `/passes`） |
+| `start` / `end` | string | UTC 时间 | 搜索区间，`end > start`，跨度 **≤ 7 天** |
+| `satellite.position_km` | number[3] | km，有限数 | 历元 ECI 位置 |
+| `satellite.velocity_km_s` | number[3] | km/s，有限数 | 历元 ECI 速度 |
+| `stations` | array | **非空** | 候选接力站列表 |
+| `stations[].id` | string | 非空、**唯一** | 站 ID，用于计划与交接标注 |
+| `stations[].latitude_deg` | number | 度，[-90, 90] | WGS84 大地纬度 |
+| `stations[].longitude_deg` | number | 度，[-180, 180] | WGS84 经度 |
+| `stations[].altitude_km` | number | km，[-12, 100000] | WGS84 椭球高 |
+| `stations[].min_elevation_deg` | number | 度，(-90, 90) | **该站**的最低仰角（含该仰角即可见） |
+
+**422 规则**：与 `/passes` 相同的时间/坐标/向量/轨道校验（退化、非束缚、
+近地点入地均 422），另外 `stations` 为空、站 `id` 为空/纯空白、或站 `id`
+重复也返回 422。
+
+### 4.3 实际请求示例
+
+类 ISS 的 420 km 圆轨道，北京（`BEIJING`，116.4°E）与东京湾
+（`TOKYO-BAY`，139.7°E）两站，最低仰角均 10°，搜索区间取两段过境的并集
+（完整文件见 [`examples/relay_request.json`](examples/relay_request.json)）：
+
+```bash
+curl -X POST http://localhost:8000/relay-plan \
+  -H 'Content-Type: application/json' \
+  -d @examples/relay_request.json
+```
+
+请求体（即 `examples/relay_request.json`）：
+
+```json
+{
+  "epoch": "2025-06-01T00:00:00Z",
+  "start": "2025-06-01T00:01:40.294555Z",
+  "end": "2025-06-01T00:09:41.322998Z",
+  "satellite": {
+    "position_km": [4270.307144917519, -1323.5276198332833, 5121.271150639637],
+    "velocity_km_s": [3.950957000514434, 6.347260232247907, -1.6540865405752112]
+  },
+  "stations": [
+    {"id": "BEIJING",   "latitude_deg": 39.9, "longitude_deg": 116.4,
+     "altitude_km": 0.05, "min_elevation_deg": 10.0},
+    {"id": "TOKYO-BAY", "latitude_deg": 35.5, "longitude_deg": 139.7,
+     "altitude_km": 0.02, "min_elevation_deg": 10.0}
+  ]
+}
+```
+
+### 4.4 实际响应（HTTP 200）
+
+与 [`examples/relay_response.json`](examples/relay_response.json) 一致：
+
+```json
+{
+  "status": "complete",
+  "search_start": "2025-06-01T00:01:40.294555Z",
+  "search_end": "2025-06-01T00:09:41.322998Z",
+  "plan": {
+    "start": "2025-06-01T00:01:40.294555Z",
+    "end": "2025-06-01T00:09:41.322998Z",
+    "duration_s": 481.028443,
+    "switches": 1,
+    "assignments": [
+      {
+        "station_id": "BEIJING",
+        "start": "2025-06-01T00:01:40.294555Z",
+        "end": "2025-06-01T00:08:29.127935Z",
+        "duration_s": 408.83338,
+        "truncated": false
+      },
+      {
+        "station_id": "TOKYO-BAY",
+        "start": "2025-06-01T00:08:29.127935Z",
+        "end": "2025-06-01T00:09:41.322998Z",
+        "duration_s": 72.195063,
+        "truncated": false
+      }
+    ],
+    "handoffs": [
+      {
+        "time": "2025-06-01T00:08:29.127935Z",
+        "from_station_id": "BEIJING",
+        "to_station_id": "TOKYO-BAY"
+      }
+    ],
+    "stations": ["BEIJING", "TOKYO-BAY"]
+  },
+  "stations": [
+    {
+      "id": "BEIJING",
+      "status": "complete",
+      "truncated": false,
+      "windows": [
+        {"start": "2025-06-01T00:01:40.294555Z",
+         "end": "2025-06-01T00:08:29.127935Z", "truncated": false}
+      ],
+      "uncovered_intervals": []
+    },
+    {
+      "id": "TOKYO-BAY",
+      "status": "complete",
+      "truncated": false,
+      "windows": [
+        {"start": "2025-06-01T00:07:28.047544Z",
+         "end": "2025-06-01T00:09:41.322998Z", "truncated": false}
+      ],
+      "uncovered_intervals": []
+    }
+  ],
+  "unknown_intervals": []
+}
+```
+
+**如何读取切换时刻**：两站窗口在 `00:07:28`–`00:08:29` 正时长重叠
+（约 61 秒），计划在 `plan.handoffs[0].time = 00:08:29.127935Z` 把责任从
+`BEIJING` 交给 `TOKYO-BAY`——这正是北京窗口的结束时刻，且严格落在东京湾
+窗口内部。`plan.assignments[]` 是无缝拼接的负责区间（前一段 `end` 等于
+后一段 `start`），每段给出负责站与该段时长；`plan.switches` 是切换次数，
+`plan.stations` 是负责站序列。本例接力覆盖整个搜索区间且无未知时段，
+故顶层 `status` 为 `complete`；搜索区间比接力段长时为 `partial`。
+
+其余字段：
+
+- `stations[]`：按请求顺序返回**每站**的 `status`（来自 `find_passes`）、
+  半开已证可见窗口（含 `truncated`）与该站自己的 `uncovered_intervals`。
+- `unknown_intervals[]`：无人已证可见、但至少有一站无法判定的时段及各站
+  原因（`"站ID: 原因"`）。所有站均证明低于门限的确定不可见时段不在其中。
+- 没有任何可见窗口时 `plan` 为 `null`：有未知时段则 `status="failed"`，
+  全部确定不可见则 `status="complete"`。
+
+### 4.5 接力 422 响应示例（站 ID 重复）
+
+把第二个站的 `id` 也改成 `"BEIJING"`（完整响应见
+[`examples/relay_error_422.json`](examples/relay_error_422.json)）：
+
+```json
+{
+  "detail": [
+    {
+      "type": "value_error",
+      "loc": ["body"],
+      "msg": "Value error, station 'id' values must be unique; duplicates: BEIJING"
+    }
+  ]
+}
+```
+
+---
+
+## 5. 算法说明
+
+### 5.1 两体传播
 
 由历元状态计算比机械能 ε = v²/2 − μ/r 与离心率矢量，要求 ε < 0、
 e < 1。任意时刻 t = t₀ + Δt 用开普勒方程 M = E − e·sin E
@@ -224,7 +407,7 @@ e < 1。任意时刻 t = t₀ + Δt 用开普勒方程 M = E − e·sin E
 无近点奇点。自测：一个周期后状态误差为 0，3 天内能量/角动量
 相对漂移 < 1e-15。
 
-### 4.2 坐标与时角
+### 5.2 坐标与时角
 
 - GMST 使用 IAU 1982 模型（J2000 锚点 18h41m50.543s）。距 J2000 的
   日数直接由秒差计算——若先合成完整儒略日（≈2.46×10⁶）再相减，双精度
@@ -234,7 +417,7 @@ e < 1。任意时刻 t = t₀ + Δt 用开普勒方程 M = E − e·sin E
 - ENU 基由测站纬经度固定，仰角 `asin(ρ_up/|ρ|)`、
   方位角 `atan2(ρ_E, ρ_N)`；并给出仰角/方位角解析变化率供自适应用。
 
-### 4.3 两级自适应扫描（不漏窗口）
+### 5.3 两级自适应扫描（不漏窗口）
 
 1. **粗扫（几何门限）**：只算卫星—测站的**地心角** α。可见要求
    cos α ≥ R站/r星，因此用远地点构造最松门限 ψ_flag（地平角 + 8° 缓冲）。
@@ -264,7 +447,7 @@ e < 1。任意时刻 t = t₀ + Δt 用开普勒方程 M = E − e·sin E
 其余窗口不漏。与独立的 0.25 s 均匀网格真值对比（1 天类 ISS 轨道）：
 窗口数完全一致，升/落时刻误差 < 0.05 s，峰值仰角误差 < 0.001°。
 
-### 4.4 半开区间与失败报告
+### 5.4 半开区间与失败报告
 
 - 搜索域为 **[start, end)**：恰在 `end` 发生的降落穿越按区间内处理
   （窗口闭合于该时刻）；恰在 `start` 已可见则标记 `start_open=true`，
@@ -279,26 +462,45 @@ e < 1。任意时刻 t = t₀ + Δt 用开普勒方程 M = E − e·sin E
   擦边区间同样进入 `uncovered_intervals`（相邻残段合并为一条），
   `coverage_fraction = 1 − 未覆盖秒数/搜索跨度` 随之如实下降。
 
-### 4.5 性能
+### 5.5 多站接力规划（relay.py）
+
+- 对每个站独立调用 `find_passes`，其窗口即该站的“已证可见”半开区间，
+  `truncated` 与 `uncovered_intervals` 原样保留，**不做任何乐观外推**。
+- 以窗口为节点、**异站且正时长重叠**为边，用并查集求连通分量；每个分量的
+  `[最早 start, 最晚 end)` 即一条可连续接力的时段（贪心“最远可达”论证保证
+  存在一条正重叠交接链贯穿全段）。
+- 分量内按 `end` 升序做 DAG 最短路求**最少切换次数**的窗口链：边 j→i 要求
+  异站、`w_i.start < w_j.end < w_i.end`（i 正时长包住 j 的结束点）且
+  `w_i.end > w_j.end`（i 把接力延伸得更远）。切换点取前一窗口的 `end`，
+  它严格落在后一窗口内部，故负责区间无缝拼接。
+- 等长方案按 `(−时长, 切换次数, 开始时刻, 负责站 ID 元组)` 取最小稳定裁决。
+- 未知时段 = 搜索区间减去所有站可见窗口并集，再与所有站
+  `uncovered_intervals` 并集**取交**：只有“无人证明可见且有人无法判定”的
+  部分才列入 `unknown_intervals`；所有站都已证明低于门限的部分是确定
+  不可见，绝不报未知，也绝不报完整覆盖。
+
+### 5.6 性能
 
 典型开销（单机纯 Python）：7 天类 ISS 任务约 8300 次粗扫 + 6.7 万次
 细扫求值，耗时约 7 秒；6 小时任务约 0.1–0.5 秒。高轨（GEO、闪电轨道）
 更省或相当。病态擦边场景（峰值距阈值 <1e-6°）会触发递归细分，
-单次请求额外求值以 20 万次为上限。
+单次请求额外求值以 20 万次为上限。`/relay-plan` 的传播/求值开销随站数
+线性增长（每站一次完整的 `/passes` 级计算），接力图本身为 O(W²)。
 
 ---
 
-## 5. 项目结构
+## 6. 项目结构
 
 ```
 app/
-  main.py        # FastAPI 路由、422 映射、响应组装
-  schemas.py     # Pydantic 请求/响应模型与范围校验
+  main.py        # FastAPI 路由、422 映射、/passes 与 /relay-plan 响应组装
+  schemas.py     # Pydantic 请求/响应模型与范围校验（含站 ID 唯一性）
   mechanics.py   # WGS84 常数、两体开普勒传播
   geometry.py    # 大地坐标、GMST、ECI/ECEF、ENU、仰角/方位角
   passes.py      # 两级自适应扫描、二分穿越、黄金分割峰值
+  relay.py       # 已证可见窗口的连通分量、最少切换 DAG、未知区间
   time_utils.py  # UTC/儒略日/GMST
-examples/        # 真实请求、成功响应与 422 响应
-tests/           # pytest：24 项（含独立网格真值交叉验证、擦边过境回归、422 全分支）
+examples/        # /passes 与 /relay-plan 的真实请求、成功与 422 响应
+tests/           # pytest：52 项（网格真值交叉验证、擦边回归、接力交接/裁决/未知语义、422 全分支）
 Dockerfile, docker-compose.yml, requirements.txt
 ```

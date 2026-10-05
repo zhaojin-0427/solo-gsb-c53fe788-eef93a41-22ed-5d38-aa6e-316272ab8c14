@@ -1,0 +1,67 @@
+{
+  "status": "complete",
+  "search_start": "2025-06-01T00:01:40.294555Z",
+  "search_end": "2025-06-01T00:09:41.322998Z",
+  "plan": {
+    "start": "2025-06-01T00:01:40.294555Z",
+    "end": "2025-06-01T00:09:41.322998Z",
+    "duration_s": 481.028443,
+    "switches": 1,
+    "assignments": [
+      {
+        "station_id": "BEIJING",
+        "start": "2025-06-01T00:01:40.294555Z",
+        "end": "2025-06-01T00:08:29.127935Z",
+        "duration_s": 408.83338,
+        "truncated": false
+      },
+      {
+        "station_id": "TOKYO-BAY",
+        "start": "2025-06-01T00:08:29.127935Z",
+        "end": "2025-06-01T00:09:41.322998Z",
+        "duration_s": 72.195063,
+        "truncated": false
+      }
+    ],
+    "handoffs": [
+      {
+        "time": "2025-06-01T00:08:29.127935Z",
+        "from_station_id": "BEIJING",
+        "to_station_id": "TOKYO-BAY"
+      }
+    ],
+    "stations": [
+      "BEIJING",
+      "TOKYO-BAY"
+    ]
+  },
+  "stations": [
+    {
+      "id": "BEIJING",
+      "status": "complete",
+      "truncated": false,
+      "windows": [
+        {
+          "start": "2025-06-01T00:01:40.294555Z",
+          "end": "2025-06-01T00:08:29.127935Z",
+          "truncated": false
+        }
+      ],
+      "uncovered_intervals": []
+    },
+    {
+      "id": "TOKYO-BAY",
+      "status": "complete",
+      "truncated": false,
+      "windows": [
+        {
+          "start": "2025-06-01T00:07:28.047544Z",
+          "end": "2025-06-01T00:09:41.322998Z",
+          "truncated": false
+        }
+      ],
+      "uncovered_intervals": []
+    }
+  ],
+  "unknown_intervals": []
+}

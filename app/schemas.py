@@ -51,6 +51,22 @@ class GroundStation(BaseModel):
                                description="WGS84 ellipsoidal height, km.")
 
 
+def _aware_utc(v: datetime, name: str) -> datetime:
+    if v.tzinfo is None or v.tzinfo.utcoffset(v) is None:
+        raise ValueError(f"{name} must be timezone-aware UTC (use e.g. 'Z')")
+    return v.astimezone(timezone.utc)
+
+
+def _check_search_window(epoch: datetime, start: datetime, end: datetime):
+    if end <= start:
+        raise ValueError("'end' must be strictly after 'start'")
+    if end - start > MAX_SPAN:
+        raise ValueError("search span (end - start) must not exceed 7 days")
+    for name, t in (("start", start), ("end", end)):
+        if abs((t - epoch)) > timedelta(days=3650):
+            raise ValueError(f"'{name}' is more than 10 years from 'epoch'")
+
+
 class PassRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -69,20 +85,11 @@ class PassRequest(BaseModel):
     @field_validator("epoch", "start", "end")
     @classmethod
     def _aware(cls, v: datetime, info):
-        if v.tzinfo is None or v.tzinfo.utcoffset(v) is None:
-            raise ValueError(f"{info.field_name} must be timezone-aware UTC (use e.g. 'Z')")
-        return v.astimezone(timezone.utc)
+        return _aware_utc(v, info.field_name)
 
     @model_validator(mode="after")
     def _check_times(self):
-        if self.end <= self.start:
-            raise ValueError("'end' must be strictly after 'start'")
-        if self.end - self.start > MAX_SPAN:
-            raise ValueError("search span (end - start) must not exceed 7 days")
-        # Reject absurd offsets of the search window from the epoch.
-        for name, t in (("start", self.start), ("end", self.end)):
-            if abs((t - self.epoch)) > timedelta(days=3650):
-                raise ValueError(f"'{name}' is more than 10 years from 'epoch'")
+        _check_search_window(self.epoch, self.start, self.end)
         return self
 
 
@@ -116,3 +123,115 @@ class PassResponse(BaseModel):
     search_end: datetime
     min_elevation_deg: float
     diagnostics: dict
+
+
+# ------------------------------------------------------------------ relay
+class RelayGroundStation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(
+        ..., min_length=1,
+        description="Unique non-empty station identifier used in the plan.",
+    )
+    latitude_deg: float = Field(..., ge=-90.0, le=90.0,
+                                description="WGS84 geodetic latitude, degrees.")
+    longitude_deg: float = Field(..., ge=-180.0, le=180.0,
+                                 description="WGS84 longitude, degrees.")
+    altitude_km: float = Field(..., ge=-12.0, le=100000.0,
+                               description="WGS84 ellipsoidal height, km.")
+    min_elevation_deg: float = Field(
+        ..., gt=-90.0, lt=90.0,
+        description="Per-station minimum elevation considered visible, deg.",
+    )
+
+    @field_validator("id")
+    @classmethod
+    def _id_nonblank(cls, v):
+        if not v.strip():
+            raise ValueError("station 'id' must not be blank")
+        return v
+
+
+class RelayRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    epoch: datetime = Field(
+        ..., description="UTC epoch of the satellite state (timezone aware)."
+    )
+    start: datetime = Field(..., description="UTC search start (timezone aware).")
+    end: datetime = Field(..., description="UTC search end (timezone aware).")
+    satellite: SatelliteState
+    stations: list[RelayGroundStation] = Field(
+        ..., min_length=1,
+        description="Non-empty list of candidate relay stations.",
+    )
+
+    @field_validator("epoch", "start", "end")
+    @classmethod
+    def _aware(cls, v: datetime, info):
+        return _aware_utc(v, info.field_name)
+
+    @model_validator(mode="after")
+    def _check(self):
+        _check_search_window(self.epoch, self.start, self.end)
+        ids = [s.id for s in self.stations]
+        if len(ids) != len(set(ids)):
+            dupes = sorted({i for i in ids if ids.count(i) > 1})
+            raise ValueError(
+                "station 'id' values must be unique; duplicates: "
+                + ", ".join(dupes)
+            )
+        return self
+
+
+class RelayWindowOut(BaseModel):
+    start: datetime
+    end: datetime
+    truncated: bool
+
+
+class RelayAssignmentOut(BaseModel):
+    station_id: str
+    start: datetime
+    end: datetime
+    duration_s: float
+    truncated: bool
+
+
+class RelayHandoffOut(BaseModel):
+    time: datetime
+    from_station_id: str
+    to_station_id: str
+
+
+class RelayPlanOut(BaseModel):
+    start: datetime
+    end: datetime
+    duration_s: float
+    switches: int
+    assignments: list[RelayAssignmentOut]
+    handoffs: list[RelayHandoffOut]
+    stations: list[str]
+
+
+class RelayStationOut(BaseModel):
+    id: str
+    status: Literal["complete", "partial", "failed"]
+    truncated: bool
+    windows: list[RelayWindowOut]
+    uncovered_intervals: list[UncoveredOut]
+
+
+class RelayUnknownOut(BaseModel):
+    start: datetime
+    end: datetime
+    reasons: list[str]
+
+
+class RelayResponse(BaseModel):
+    status: Literal["complete", "partial", "failed"]
+    search_start: datetime
+    search_end: datetime
+    plan: Optional[RelayPlanOut] = None
+    stations: list[RelayStationOut]
+    unknown_intervals: list[RelayUnknownOut]
